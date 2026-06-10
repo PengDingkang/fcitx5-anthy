@@ -46,6 +46,52 @@
 #include <unistd.h>
 #include <utility>
 
+namespace {
+
+class MobileCandidate : public fcitx::CandidateWord {
+public:
+    MobileCandidate(AnthyState *anthy, std::string str, unsigned int idx)
+        : anthy_(anthy), idx_(idx) {
+        setText(fcitx::Text(std::move(str)));
+    }
+
+    void select(fcitx::InputContext * /*inputContext*/) const override {
+        anthy_->selectMobileCandidate(idx_);
+        anthy_->updateUI();
+    }
+
+private:
+    AnthyState *anthy_;
+    unsigned int idx_;
+};
+
+void joinAllSegments(anthy_context_t context) {
+    while (true) {
+        struct anthy_conv_stat convStat;
+        anthy_get_stat(context, &convStat);
+        if (convStat.nr_segment > 1) {
+            anthy_resize_segment(context, 0, 1);
+        } else {
+            break;
+        }
+    }
+}
+
+std::string anthySegmentCandidate(anthy_context_t context, int candidate) {
+    int len = anthy_get_segment(context, 0, candidate, nullptr, 0);
+    if (len <= 0) {
+        return {};
+    }
+
+    std::vector<char> buf;
+    buf.resize(len + 1);
+    anthy_get_segment(context, 0, candidate, buf.data(), len + 1);
+    buf[len] = '\0';
+    return buf.data();
+}
+
+} // namespace
+
 AnthyState::AnthyState(fcitx::InputContext *ic, AnthyEngine *engine,
                        fcitx::Instance *instance)
     : ic_(ic), engine_(engine), instance_(instance), preedit_(*this),
@@ -105,6 +151,9 @@ bool AnthyState::processKeyEventInput(const fcitx::KeyEvent &key) {
         if (isRealtimeConversion()) {
             preedit_.convert(FCITX_ANTHY_CANDIDATE_DEFAULT, isSingleSegment());
             preedit_.selectSegment(-1);
+            unsetLookupTable();
+        } else if (!preedit_.isConverting()) {
+            updateMobileCandidateList();
         }
         // show_preedit_string ();
         preeditVisible_ = true;
@@ -274,6 +323,31 @@ void AnthyState::selectCandidate(unsigned int item) {
     action_select_next_segment();
 }
 
+void AnthyState::selectMobileCandidate(unsigned int item) {
+    if (!preedit_.isPreediting()) {
+        return;
+    }
+
+    const std::string source = preedit_.string();
+    if (source.empty()) {
+        return;
+    }
+
+    preedit_.finish();
+    preedit_.convert(source, true);
+    if (preedit_.isConverting()) {
+        preedit_.selectCandidate(item);
+        commitString(preedit_.string());
+        if (*config().general->learnOnManualCommit) {
+            preedit_.commit();
+        }
+    } else {
+        commitString(source);
+    }
+
+    reset();
+}
+
 void AnthyState::reset() {
     ic_->inputPanel().reset();
 
@@ -365,6 +439,79 @@ std::shared_ptr<fcitx::CandidateList> AnthyState::setLookupTable() {
     }
     ic_->inputPanel().setCandidateList(nullptr);
     return std::shared_ptr<fcitx::CandidateList>(candList.release());
+}
+
+void AnthyState::updateMobileCandidateList() {
+    if (!preedit_.isPreediting() || preedit_.isConverting() ||
+        inputMode() == InputMode::LATIN ||
+        inputMode() == InputMode::WIDE_LATIN) {
+        unsetLookupTable();
+        return;
+    }
+
+    const std::string source = preedit_.string();
+    if (source.empty()) {
+        unsetLookupTable();
+        return;
+    }
+
+    fcitx::UniqueCPtr<anthy_context, anthy_release_context> context(
+        anthy_create_context());
+    if (!context) {
+        unsetLookupTable();
+        return;
+    }
+
+    anthy_context_set_encoding(context.get(), ANTHY_UTF8_ENCODING);
+    anthy_set_string(context.get(), source.c_str());
+    joinAllSegments(context.get());
+
+    struct anthy_conv_stat convStat;
+    anthy_get_stat(context.get(), &convStat);
+    if (convStat.nr_segment <= 0) {
+        unsetLookupTable();
+        return;
+    }
+
+    struct anthy_segment_stat segStat;
+    anthy_get_segment_stat(context.get(), 0, &segStat);
+    if (segStat.nr_candidate <= 0) {
+        unsetLookupTable();
+        return;
+    }
+
+    auto candList = std::make_unique<fcitx::CommonCandidateList>();
+    candList->setLayoutHint(fcitx::CandidateLayoutHint::Horizontal);
+    candList->setPageSize(*config().general->pageSize);
+    candList->setCursorPositionAfterPaging(
+        fcitx::CursorPositionAfterPaging::SameAsLast);
+    candList->setSelectionKey(util::selection_keys());
+
+    std::vector<std::string> added;
+    for (int i = 0; i < segStat.nr_candidate; i++) {
+        auto candidate = anthySegmentCandidate(context.get(), i);
+        if (candidate.empty() ||
+            std::find(added.begin(), added.end(), candidate) != added.end()) {
+            continue;
+        }
+        added.push_back(candidate);
+        candList->append<MobileCandidate>(this, std::move(candidate),
+                                          static_cast<unsigned int>(i));
+    }
+
+    if (candList->size() == 0) {
+        unsetLookupTable();
+        return;
+    }
+
+    cursorPos_ = 0;
+    nConvKeyPressed_ = 0;
+    lookupTableVisible_ = true;
+    candList->setGlobalCursorIndex(cursorPos_);
+    candList->setPage(0);
+    ic_->inputPanel().setCandidateList(std::move(candList));
+    ic_->inputPanel().setAuxUp(fcitx::Text());
+    uiUpdate_ = true;
 }
 
 void AnthyState::unsetLookupTable() {
@@ -578,6 +725,7 @@ bool AnthyState::action_back() {
     if (preedit_.isConverting()) {
         action_revert();
         if (!isRealtimeConversion()) {
+            updateMobileCandidateList();
             return true;
         }
     }
@@ -588,6 +736,9 @@ bool AnthyState::action_back() {
         if (isRealtimeConversion()) {
             preedit_.convert(FCITX_ANTHY_CANDIDATE_DEFAULT, isSingleSegment());
             preedit_.selectSegment(-1);
+            unsetLookupTable();
+        } else {
+            updateMobileCandidateList();
         }
         setPreedition();
     } else {
@@ -605,6 +756,7 @@ bool AnthyState::action_delete() {
     if (preedit_.isConverting()) {
         action_revert();
         if (!isRealtimeConversion()) {
+            updateMobileCandidateList();
             return true;
         }
     }
@@ -615,6 +767,9 @@ bool AnthyState::action_delete() {
         if (isRealtimeConversion()) {
             preedit_.convert(FCITX_ANTHY_CANDIDATE_DEFAULT, isSingleSegment());
             preedit_.selectSegment(-1);
+            unsetLookupTable();
+        } else {
+            updateMobileCandidateList();
         }
         setPreedition();
     } else {

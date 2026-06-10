@@ -135,6 +135,7 @@ public:
     bool supportClientPreedit();
 
     bool actionSelectCandidate(unsigned int i);
+    void selectMobileCandidate(unsigned int i);
     void resetCursor(int cursor);
     void autoCommit(fcitx::InputContextEvent &event);
     void selectCandidateNoDirect(unsigned int item);
@@ -150,6 +151,7 @@ private:
     void setPreedition();
     void setAuxString();
     std::shared_ptr<fcitx::CandidateList> setLookupTable();
+    void updateMobileCandidateList();
     void unsetLookupTable();
     bool isSelectingCandidates();
     bool convertKana(CandidateType type);
